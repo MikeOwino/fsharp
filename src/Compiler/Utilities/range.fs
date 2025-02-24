@@ -196,7 +196,6 @@ type FileIndexTable() =
         match fileToIndexTable.TryGetValue filePath with
         | true, idx -> idx
         | _ ->
-
             // Try again looking for a normalized entry.
             let normalizedFilePath =
                 if normalize then
@@ -208,26 +207,30 @@ type FileIndexTable() =
             | true, idx ->
                 // Record the non-normalized entry if necessary
                 if filePath <> normalizedFilePath then
-                    lock fileToIndexTable (fun () -> fileToIndexTable[filePath] <- idx)
+                    fileToIndexTable[filePath] <- idx
 
                 // Return the index
                 idx
 
             | _ ->
-                lock fileToIndexTable (fun () ->
-                    // Get the new index
-                    let idx = indexToFileTable.Count
+                lock indexToFileTable (fun () ->
+                    // See if it was added on another thread
+                    match fileToIndexTable.TryGetValue normalizedFilePath with
+                    | true, idx -> idx
+                    | _ ->
+                        // Okay it's really not there
+                        let idx = indexToFileTable.Count
 
-                    // Record the normalized entry
-                    indexToFileTable.Add normalizedFilePath
-                    fileToIndexTable[normalizedFilePath] <- idx
+                        // Record the normalized entry
+                        indexToFileTable.Add normalizedFilePath
+                        fileToIndexTable[normalizedFilePath] <- idx
 
-                    // Record the non-normalized entry if necessary
-                    if filePath <> normalizedFilePath then
-                        fileToIndexTable[filePath] <- idx
+                        // Record the non-normalized entry if necessary
+                        if filePath <> normalizedFilePath then
+                            fileToIndexTable[filePath] <- idx
 
-                    // Return the index
-                    idx)
+                        // Return the index
+                        idx)
 
     member t.IndexToFile n =
         if n < 0 then
@@ -359,7 +362,7 @@ type Range(code1: int64, code2: int64) =
                 if FileSystem.IsInvalidPathShim m.FileName then
                     "path invalid: " + m.FileName
                 elif not (FileSystem.FileExistsShim m.FileName) then
-                    "non existing file: " + m.FileName
+                    "nonexistent file: " + m.FileName
                 else
                     FileSystem.OpenFileForReadShim(m.FileName).ReadLines()
                     |> Seq.skip (m.StartLine - 1)
@@ -445,10 +448,22 @@ module Range =
     let mkFileIndexRange fileIndex startPos endPos = range (fileIndex, startPos, endPos)
 
     let posOrder =
-        Order.orderOn (fun (p: pos) -> p.Line, p.Column) (Pair.order (Int32.order, Int32.order))
+        let pairOrder = Pair.order (Int32.order, Int32.order)
+        let lineAndColumn = fun (p: pos) -> p.Line, p.Column
+
+        { new IComparer<pos> with
+            member _.Compare(x, xx) =
+                pairOrder.Compare(lineAndColumn x, lineAndColumn xx)
+        }
 
     let rangeOrder =
-        Order.orderOn (fun (r: range) -> r.FileName, (r.Start, r.End)) (Pair.order (String.order, Pair.order (posOrder, posOrder)))
+        let tripleOrder = Pair.order (String.order, Pair.order (posOrder, posOrder))
+        let fileLineColumn = fun (r: range) -> r.FileName, (r.Start, r.End)
+
+        { new IComparer<range> with
+            member _.Compare(x, xx) =
+                tripleOrder.Compare(fileLineColumn x, fileLineColumn xx)
+        }
 
     let outputRange (os: TextWriter) (m: range) =
         fprintf os "%s%a-%a" m.FileName outputPos m.Start outputPos m.End

@@ -330,15 +330,15 @@ type Graph<'Data, 'Id when 'Id : comparison and 'Id : equality>
 // with care.
 //----------------------------------------------------------------------------
 
-type NonNullSlot<'T> = 'T
-let nullableSlotEmpty() = Unchecked.defaultof<'T>
-let nullableSlotFull x = x
+type NonNullSlot<'T when 'T : not struct> = 'T
+let nullableSlotEmpty() : NonNullSlot<'T> = Unchecked.defaultof<_>
+let nullableSlotFull (x: 'T) : NonNullSlot<'T> = x
 
 //---------------------------------------------------------------------------
 // Caches, mainly for free variables
 //---------------------------------------------------------------------------
 
-type cache<'T> = { mutable cacheVal: 'T NonNullSlot }
+type cache<'T when 'T : not struct> = { mutable cacheVal: NonNullSlot<'T> }
 let newCache() = { cacheVal = nullableSlotEmpty() }
 
 let inline cached cache ([<InlineIfLambda>] resF) =
@@ -403,7 +403,10 @@ type DisposablesTracker() =
     let items = Stack<IDisposable>()
 
     /// Register some items to dispose
-    member _.Register i = items.Push i
+    member _.Register (i:#IDisposable MaybeNull) = 
+        match box i with
+        | null -> ()
+        | _ -> items.Push (!!i)
 
     interface IDisposable with
 

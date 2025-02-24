@@ -9,6 +9,7 @@ namespace FSharp.Compiler.Diagnostics
 
 open System
 
+open FSharp.Compiler.AttributeChecking
 open FSharp.Compiler.CheckExpressions
 open FSharp.Compiler.ConstraintSolver
 open FSharp.Compiler.SignatureConformance
@@ -18,7 +19,6 @@ open FSharp.Compiler.TypedTree
 open FSharp.Compiler.TypedTreeBasics
 open FSharp.Compiler.TypedTreeOps
 open Internal.Utilities.Library
-open Internal.Utilities.Library.Extras
 
 open FSharp.Core.Printf
 open FSharp.Compiler
@@ -67,6 +67,28 @@ module ExtendedData =
     [<Interface; Experimental("This FCS API is experimental and subject to change.")>]
     type IFSharpDiagnosticExtendedData = interface end
 
+    /// Additional data for diagnostics about obsolete attributes.
+    [<Class; Experimental("This FCS API is experimental and subject to change.")>]
+    type ObsoleteDiagnosticExtendedData
+        internal (diagnosticId: string option, urlFormat: string option) =
+        interface IFSharpDiagnosticExtendedData
+        /// Represents the DiagnosticId of the diagnostic
+        member this.DiagnosticId: string option = diagnosticId
+
+        /// Represents the URL format of the diagnostic
+        member this.UrlFormat: string option = urlFormat
+
+    /// Additional data for diagnostics about experimental attributes.
+    [<Class; Experimental("This FCS API is experimental and subject to change.")>]
+    type ExperimentalExtendedData
+        internal (diagnosticId: string option, urlFormat: string option) =
+        interface IFSharpDiagnosticExtendedData
+        /// Represents the DiagnosticId of the diagnostic
+        member this.DiagnosticId: string option = diagnosticId
+
+        /// Represents the URL format of the diagnostic
+        member this.UrlFormat: string option = urlFormat
+    
     [<Experimental("This FCS API is experimental and subject to change.")>]
     type TypeMismatchDiagnosticExtendedData
         internal (symbolEnv: SymbolEnv, dispEnv: DisplayEnv, expectedType: TType, actualType: TType, context: DiagnosticContextInfo) =
@@ -106,6 +128,13 @@ module ExtendedData =
         member x.ImplementationName = implArg.idText
         member x.SignatureRange = sigArg.idRange
         member x.ImplementationRange = implArg.idRange
+        
+    [<Class; Experimental("This FCS API is experimental and subject to change.")>]
+    type DefinitionsInSigAndImplNotCompatibleAbbreviationsDifferExtendedData
+        internal(signatureType: Tycon, implementationType: Tycon) =
+        interface IFSharpDiagnosticExtendedData
+        member x.SignatureRange: range = signatureType.Range
+        member x.ImplementationRange: range = implementationType.Range
 
 open ExtendedData
 
@@ -182,15 +211,23 @@ type FSharpDiagnostic(m: range, severity: FSharpDiagnosticSeverity, message: str
             | FunctionValueUnexpected(_, actualType, _) ->
                 Some(ExpressionIsAFunctionExtendedData(symbolEnv, actualType))
 
-            | FieldNotContained(_, _, implEntity, sigEntity, impl, sign, _) ->
+            | FieldNotContained(_,_, _, implEntity, sigEntity, impl, sign, _) ->
                 Some(FieldNotContainedDiagnosticExtendedData(symbolEnv, implEntity, sigEntity, sign, impl))
 
-            | ValueNotContained(_, _, _, implValue, sigValue, _) ->
+            | ValueNotContained(_,_, _, _, implValue, sigValue, _) ->
                 Some(ValueNotContainedDiagnosticExtendedData(symbolEnv, sigValue, implValue))
 
             | ArgumentsInSigAndImplMismatch(sigArg, implArg) ->
                 Some(ArgumentsInSigAndImplMismatchExtendedData(sigArg, implArg))
 
+            | DefinitionsInSigAndImplNotCompatibleAbbreviationsDiffer(implTycon = implTycon; sigTycon = sigTycon) ->
+                Some(DefinitionsInSigAndImplNotCompatibleAbbreviationsDifferExtendedData(sigTycon, implTycon))
+
+            | ObsoleteDiagnostic(diagnosticId= diagnosticId; urlFormat= urlFormat) ->
+                Some(ObsoleteDiagnosticExtendedData(diagnosticId, urlFormat))
+                
+            | Experimental(diagnosticId= diagnosticId; urlFormat= urlFormat) ->
+                Some(ExperimentalExtendedData(diagnosticId, urlFormat))
             | _ -> None
 
         let msg =
@@ -294,13 +331,12 @@ type internal CompilationDiagnosticLogger (debugName: string, options: FSharpDia
             | Some f -> f diagnostic
             | None -> diagnostic
 
-        if diagnostic.ReportAsError (options, severity) then
+        match diagnostic.AdjustSeverity(options, severity) with
+        | FSharpDiagnosticSeverity.Error ->
             diagnostics.Add(diagnostic, FSharpDiagnosticSeverity.Error)
             errorCount <- errorCount + 1
-        elif diagnostic.ReportAsWarning (options, severity) then
-            diagnostics.Add(diagnostic, FSharpDiagnosticSeverity.Warning)
-        elif diagnostic.ReportAsInfo (options, severity) then
-            diagnostics.Add(diagnostic, severity)
+        | FSharpDiagnosticSeverity.Hidden -> ()
+        | sev -> diagnostics.Add(diagnostic, sev)
 
     override _.ErrorCount = errorCount
 
@@ -309,23 +345,18 @@ type internal CompilationDiagnosticLogger (debugName: string, options: FSharpDia
 module DiagnosticHelpers =                            
 
     let ReportDiagnostic (options: FSharpDiagnosticOptions, allErrors, mainInputFileName, fileInfo, diagnostic: PhasedDiagnostic, severity, suggestNames, flatErrors, symbolEnv) =
-        [ let severity = 
-               if diagnostic.ReportAsError (options, severity) then
-                   FSharpDiagnosticSeverity.Error
-               else
-                   severity
-
-          if severity = FSharpDiagnosticSeverity.Error ||
-             diagnostic.ReportAsWarning (options, severity) ||
-             diagnostic.ReportAsInfo (options, severity) then 
+        match diagnostic.AdjustSeverity(options, severity) with
+        | FSharpDiagnosticSeverity.Hidden -> []
+        | adjustedSeverity ->
 
             // We use the first line of the file as a fallbackRange for reporting unexpected errors.
             // Not ideal, but it's hard to see what else to do.
             let fallbackRange = rangeN mainInputFileName 1
-            let diagnostic = FSharpDiagnostic.CreateFromExceptionAndAdjustEof (diagnostic, severity, fallbackRange, fileInfo, suggestNames, flatErrors, symbolEnv)
+            let diagnostic = FSharpDiagnostic.CreateFromExceptionAndAdjustEof (diagnostic, adjustedSeverity, fallbackRange, fileInfo, suggestNames, flatErrors, symbolEnv)
             let fileName = diagnostic.Range.FileName
             if allErrors || fileName = mainInputFileName || fileName = TcGlobals.DummyFileNameForRangesWithoutASpecificLocation then
-                yield diagnostic ]
+                [diagnostic]
+            else []
 
     let CreateDiagnostics (options, allErrors, mainInputFileName, diagnostics, suggestNames, flatErrors, symbolEnv) =
         let fileInfo = (Int32.MaxValue, Int32.MaxValue)
