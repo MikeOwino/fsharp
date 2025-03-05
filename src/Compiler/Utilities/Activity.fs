@@ -6,6 +6,9 @@ open System
 open System.Diagnostics
 open System.IO
 open System.Text
+open Internal.Utilities.Library
+open System.Collections.Generic
+
 
 module ActivityNames =
     [<Literal>]
@@ -33,6 +36,13 @@ module internal Activity =
         let gc2 = "gc2"
         let outputDllFile = "outputDllFile"
         let buildPhase = "buildPhase"
+        let version = "version"
+        let stackGuardName = "stackGuardName"
+        let stackGuardCurrentDepth = "stackGuardCurrentDepth"
+        let stackGuardMaxDepth = "stackGuardMaxDepth"
+        let callerMemberName = "callerMemberName"
+        let callerFilePath = "callerFilePath"
+        let callerLineNumber = "callerLineNumber"
 
         let AllKnownTags =
             [|
@@ -49,46 +59,60 @@ module internal Activity =
                 gc2
                 outputDllFile
                 buildPhase
+                stackGuardName
+                stackGuardCurrentDepth
+                stackGuardMaxDepth
+                callerMemberName
+                callerFilePath
+                callerLineNumber
             |]
 
     module Events =
         let cacheHit = "cacheHit"
 
-    type System.Diagnostics.Activity with
+    type Diagnostics.Activity with
 
         member this.RootId =
             let rec rootID (act: Activity) =
-                if isNull act.ParentId then act.Id else rootID act.Parent
+                match act.Parent with
+                | null -> act.Id
+                | parent -> rootID parent
 
             rootID this
 
         member this.Depth =
             let rec depth (act: Activity) acc =
-                if isNull act.ParentId then
-                    acc
-                else
-                    depth act.Parent (acc + 1)
+                match act.Parent with
+                | null -> acc
+                | parent -> depth parent (acc + 1)
 
             depth this 0
 
     let private activitySource = new ActivitySource(ActivityNames.FscSourceName)
 
-    let start (name: string) (tags: (string * string) seq) : IDisposable =
+    let start (name: string) (tags: (string * string) seq) : IDisposable MaybeNull =
         let activity = activitySource.CreateActivity(name, ActivityKind.Internal)
 
         match activity with
-        | null -> activity
+        | null -> activity 
         | activity ->
             for key, value in tags do
                 activity.AddTag(key, value) |> ignore
 
             activity.Start()
 
-    let startNoTags (name: string) : IDisposable = activitySource.StartActivity name
+    let startNoTags (name: string) : IDisposable MaybeNull = activitySource.StartActivity name
 
-    let addEvent name =
-        if (not (isNull Activity.Current)) && Activity.Current.Source = activitySource then
-            Activity.Current.AddEvent(ActivityEvent name) |> ignore
+    let addEventWithTags name (tags: (string * objnull) seq) =
+        match Activity.Current with
+        | null -> ()
+        | activity when activity.Source = activitySource ->
+            let collection = tags |> Seq.map KeyValuePair |> ActivityTagsCollection
+            let event = new ActivityEvent(name, tags = collection)
+            activity.AddEvent event |> ignore
+        | _ -> ()
+
+    let addEvent name = addEventWithTags name Seq.empty
 
     module Profiling =
 
@@ -104,7 +128,7 @@ module internal Activity =
 
         let private profiledSource = new ActivitySource(ActivityNames.ProfiledSourceName)
 
-        let startAndMeasureEnvironmentStats (name: string) : IDisposable = profiledSource.StartActivity(name)
+        let startAndMeasureEnvironmentStats (name: string) : IDisposable MaybeNull = profiledSource.StartActivity(name)
 
         type private GCStats = int[]
 
@@ -121,16 +145,17 @@ module internal Activity =
                     ActivityStarted = (fun a -> a.AddTag(gcStatsInnerTag, collectGCStats ()) |> ignore),
                     ActivityStopped =
                         (fun a ->
-                            let statsBefore = a.GetTagItem(gcStatsInnerTag) :?> GCStats
                             let statsAfter = collectGCStats ()
                             let p = Process.GetCurrentProcess()
                             a.AddTag(Tags.workingSetMB, p.WorkingSet64 / 1_000_000L) |> ignore
                             a.AddTag(Tags.handles, p.HandleCount) |> ignore
                             a.AddTag(Tags.threads, p.Threads.Count) |> ignore
 
-                            for i = 0 to statsAfter.Length - 1 do
-                                a.AddTag($"gc{i}", statsAfter[i] - statsBefore[i]) |> ignore)
-
+                            match a.GetTagItem(gcStatsInnerTag) with
+                            | :? GCStats as statsBefore ->
+                                for i = 0 to statsAfter.Length - 1 do
+                                    a.AddTag($"gc{i}", statsAfter[i] - statsBefore[i]) |> ignore
+                            | _ -> ())
                 )
 
             ActivitySource.AddActivityListener(l)
@@ -181,11 +206,11 @@ module internal Activity =
 
     module CsvExport =
 
-        let private escapeStringForCsv (o: obj) =
-            if isNull o then
-                ""
-            else
-                let mutable txtVal = o.ToString()
+        let private escapeStringForCsv (o: obj MaybeNull) =
+            match o with
+            | null -> ""
+            | o ->
+                let mutable txtVal = match o.ToString() with | null -> "" | s -> s
                 let hasComma = txtVal.IndexOf(',') > -1
                 let hasQuote = txtVal.IndexOf('"') > -1
 
@@ -200,7 +225,7 @@ module internal Activity =
         let private createCsvRow (a: Activity) =
             let sb = new StringBuilder(128)
 
-            let appendWithLeadingComma (s: string) =
+            let appendWithLeadingComma (s: string MaybeNull) =
                 sb.Append(',') |> ignore
                 sb.Append(s) |> ignore
 
@@ -218,7 +243,7 @@ module internal Activity =
 
             sb.ToString()
 
-        let addCsvFileListener pathToFile =
+        let addCsvFileListener (pathToFile:string) =
             if pathToFile |> File.Exists |> not then
                 File.WriteAllLines(
                     pathToFile,
@@ -240,7 +265,7 @@ module internal Activity =
 
             let l =
                 new ActivityListener(
-                    ShouldListenTo = (fun a -> ActivityNames.AllRelevantNames |> Array.contains a.Name),
+                    ShouldListenTo = (fun a ->ActivityNames.AllRelevantNames |> Array.contains a.Name),
                     Sample = (fun _ -> ActivitySamplingResult.AllData),
                     ActivityStopped = (fun a -> msgQueue.Post(createCsvRow a))
                 )
